@@ -7,6 +7,9 @@ Example usage:
     python train_ils.py --model resnet18 --epochs 50 --batch-size 32
     python train_ils.py --model sigresnet18 --pretrained --lr 1e-3
 """
+import os as _os
+_os.environ.setdefault('HF_HUB_OFFLINE', '1')
+
 import argparse
 import json
 import os
@@ -137,12 +140,41 @@ def validate(model, loader, criterion, device):
 
 
 def build_model(model_name: str, num_classes: int, pretrained: bool):
-    """Create a timm model with num_classes output."""
-    model = timm.create_model(
-        model_name,
-        pretrained=pretrained,
-        num_classes=num_classes,
-    )
+    """Create a timm model with num_classes output.
+
+    Uses cached pretrained weights offline to avoid HF network timeouts.
+    Falls back to torchvision pretrained weights when HF cache is unavailable.
+    """
+    if pretrained:
+        # Try timm pretrained (offline cache from HF_HUB_OFFLINE set at module level)
+        try:
+            model = timm.create_model(model_name, pretrained=True, num_classes=num_classes)
+            print(f'Loaded timm pretrained weights for {model_name}')
+            return model
+        except Exception:
+            pass
+        # Fallback to torchvision for supported models
+        if model_name in ('resnet18', 'resnet34'):
+            print(f'Falling back to torchvision pretrained weights for {model_name}...')
+            return _build_tv_pretrained(model_name, num_classes)
+        else:
+            print(f'Cannot load pretrained weights for {model_name}, training from scratch')
+            return timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+    else:
+        return timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+
+
+def _build_tv_pretrained(model_name: str, num_classes: int):
+    """Build timm model with torchvision pretrained backbone weights."""
+    import torchvision.models as tv_models
+    tv_model = getattr(tv_models, model_name)(weights='IMAGENET1K_V1')
+    # Replace FC with our num_classes
+    in_features = tv_model.fc.in_features
+    tv_model.fc = nn.Linear(in_features, num_classes)
+    # Create timm model and copy weights
+    model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+    model.load_state_dict(tv_model.state_dict())
+    print(f'Loaded torchvision pretrained weights for {model_name}')
     return model
 
 
@@ -165,15 +197,17 @@ def build_optimizer(model, args):
         raise ValueError(f'Unknown optimizer: {args.opt}')
 
 
-def build_scheduler(optimizer, args, steps_per_epoch):
-    """Cosine annealing scheduler with linear warmup."""
-    total_steps = args.epochs * steps_per_epoch
-    warmup_steps = args.warmup_epochs * steps_per_epoch
+def build_scheduler(optimizer, args):
+    """Cosine annealing scheduler with linear warmup (epoch-based)."""
+    total_epochs = args.epochs
+    warmup_epochs = args.warmup_epochs
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    def lr_lambda(epoch):
+        # epoch is 0-indexed LambdaLR step counter
+        e = epoch + 1  # convert to 1-indexed epoch number
+        if e <= warmup_epochs:
+            return max(e, 1) / max(1, warmup_epochs)
+        progress = (e - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         return 0.5 * (1.0 + np.cos(np.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -260,7 +294,7 @@ def main():
 
     # Optimizer & scheduler
     optimizer = build_optimizer(model, args)
-    scheduler = build_scheduler(optimizer, args, len(train_loader))
+    scheduler = build_scheduler(optimizer, args)
 
     # AMP scaler
     scaler = torch.amp.GradScaler('cuda') if (args.amp and device.type == 'cuda') else None
