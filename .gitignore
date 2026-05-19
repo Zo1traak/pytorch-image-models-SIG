@@ -108,6 +108,10 @@ output/
 *.pt
 *.torch
 *.gz
+
+# Project data and training outputs
+my_dataset/
+my_training_run/
 Untitled.ipynb
 Testing notebook.ipynb
 

@@ -60,6 +60,7 @@ from .res2net import *
 from .resnest import *
 from .resnet import *
 from .resnetv2 import *
+from .signal_resnet import *
 from .rexnet import *
 from .selecsls import *
 from .senet import *
