@@ -28,7 +28,7 @@ from sklearn.metrics import (
     recall_score,
 )
 from torch.utils.data import DataLoader
-from dataset_ils import ILSInterferenceDataset, LABEL_NAMES, get_transforms
+from dataset_ils import ILSInterferenceDataset, LABEL_NAMES, get_transforms, ArcAwareSpecAugment
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -92,6 +92,9 @@ def compute_metrics(outputs: torch.Tensor, targets: torch.Tensor):
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
     model.train()
     total_loss = 0.0
+    arc_aux_criterion = nn.BCEWithLogitsLoss()
+    arc_lambda = getattr(model, 'arc_lambda', 0.0)
+
     for images, targets in loader:
         images = images.to(device)
         targets = targets.to(device)
@@ -99,14 +102,26 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
         optimizer.zero_grad()
         if scaler is not None:
             with torch.amp.autocast('cuda'):
-                outputs = model(images)
-                loss = criterion(outputs, targets)
+                out = model(images)
+                if isinstance(out, tuple):
+                    outputs, arc_out = out
+                    loss = criterion(outputs, targets)
+                    loss = loss + arc_lambda * arc_aux_criterion(arc_out.squeeze(-1), targets[:, 0])
+                else:
+                    outputs = out
+                    loss = criterion(outputs, targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(images)
-            loss = criterion(outputs, targets)
+            out = model(images)
+            if isinstance(out, tuple):
+                outputs, arc_out = out
+                loss = criterion(outputs, targets)
+                loss = loss + arc_lambda * arc_aux_criterion(arc_out.squeeze(-1), targets[:, 0])
+            else:
+                outputs = out
+                loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
@@ -121,13 +136,21 @@ def validate(model, loader, criterion, device):
     total_loss = 0.0
     all_outputs = []
     all_targets = []
+    arc_aux_criterion = nn.BCEWithLogitsLoss()
+    arc_lambda = getattr(model, 'arc_lambda', 0.0)
 
     for images, targets in loader:
         images = images.to(device)
         targets = targets.to(device)
 
-        outputs = model(images)
-        loss = criterion(outputs, targets)
+        out = model(images)
+        if isinstance(out, tuple):
+            outputs, arc_out = out
+            loss = criterion(outputs, targets)
+            loss = loss + arc_lambda * arc_aux_criterion(arc_out.squeeze(-1), targets[:, 0])
+        else:
+            outputs = out
+            loss = criterion(outputs, targets)
 
         total_loss += loss.item() * images.size(0)
         all_outputs.append(outputs)
@@ -245,8 +268,15 @@ def main():
                         help='Extra weight multiplier for Arc class in BCE loss')
     parser.add_argument('--asl', action='store_true', default=False,
                         help='Use Asymmetric Loss (focuses on hard positives)')
-    parser.add_argument('--specaugment', action='store_true', default=False,
-                        help='Apply time/frequency masking augmentation')
+    parser.add_argument('--specaug-mode', type=str, default='none',
+                        choices=['none', 'light', 'current', 'strong'],
+                        help='SpecAugment mode: light (Arc-friendly), current, strong, none')
+    parser.add_argument('--cbam', action='store_true', default=False,
+                        help='Add CBAM attention after ResNet backbone')
+    parser.add_argument('--arc-aux', action='store_true', default=False,
+                        help='Add Arc auxiliary branch')
+    parser.add_argument('--arc-lambda', type=float, default=0.5,
+                        help='Loss weight for Arc auxiliary branch')
     # Output
     parser.add_argument('--output-dir', type=str, default='my_training_run/ils_resnet')
     parser.add_argument('--seed', type=int, default=42)
@@ -263,9 +293,14 @@ def main():
     print(f'Device: {device}')
 
     # Datasets
+    specaug = None
+    if args.specaug_mode != 'none':
+        specaug = ArcAwareSpecAugment(mode=args.specaug_mode)
+        print(f'SpecAugment: mode={args.specaug_mode} (Arc time prob={specaug.arc_time_prob})')
     train_dataset = ILSInterferenceDataset(
         args.data_dir, split='train',
-        transform=get_transforms(args.img_size, is_train=True, specaugment=args.specaugment),
+        transform=get_transforms(args.img_size, is_train=True),
+        specaug=specaug,
     )
     val_dataset = ILSInterferenceDataset(
         args.data_dir, split='val',
@@ -286,7 +321,18 @@ def main():
     print(f'Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}')
 
     # Model
-    model = build_model(args.model, args.num_classes, args.pretrained)
+    if args.arc_aux:
+        from models_ils import ResNetArcAux
+        model = ResNetArcAux(backbone=args.model, num_classes=args.num_classes,
+                            pretrained=args.pretrained, arc_lambda=args.arc_lambda)
+        print(f'Model: {args.model}+ArcAux (lambda={args.arc_lambda})')
+    elif args.cbam:
+        from models_ils import ResNetCBAM
+        model = ResNetCBAM(backbone=args.model, num_classes=args.num_classes,
+                          pretrained=args.pretrained)
+        print(f'Model: {args.model}+CBAM')
+    else:
+        model = build_model(args.model, args.num_classes, args.pretrained)
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
