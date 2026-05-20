@@ -240,6 +240,13 @@ def main():
     parser.add_argument('--no-amp', action='store_false', dest='amp')
     parser.add_argument('--patience', type=int, default=15,
                         help='Early stopping patience')
+    # Loss
+    parser.add_argument('--arc-weight', type=float, default=1.0,
+                        help='Extra weight multiplier for Arc class in BCE loss')
+    parser.add_argument('--asl', action='store_true', default=False,
+                        help='Use Asymmetric Loss (focuses on hard positives)')
+    parser.add_argument('--specaugment', action='store_true', default=False,
+                        help='Apply time/frequency masking augmentation')
     # Output
     parser.add_argument('--output-dir', type=str, default='my_training_run/ils_resnet')
     parser.add_argument('--seed', type=int, default=42)
@@ -258,7 +265,7 @@ def main():
     # Datasets
     train_dataset = ILSInterferenceDataset(
         args.data_dir, split='train',
-        transform=get_transforms(args.img_size, is_train=True),
+        transform=get_transforms(args.img_size, is_train=True, specaugment=args.specaugment),
     )
     val_dataset = ILSInterferenceDataset(
         args.data_dir, split='val',
@@ -286,11 +293,20 @@ def main():
     print(f'Model: {args.model} | Total params: {total_params/1e6:.2f}M | Trainable: {trainable_params/1e6:.2f}M')
 
     # Loss
-    # Compute pos_weight for balanced BCE
-    pos_counts = np.array([5940, 5940, 5940, 5940, 5940])  # each class appears 5940 times in train
-    neg_counts = 12600 - pos_counts
-    pos_weight = torch.tensor(neg_counts / pos_counts, dtype=torch.float32).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if args.asl:
+        from timm.loss import AsymmetricLossMultiLabel
+        criterion = AsymmetricLossMultiLabel(gamma_neg=4, gamma_pos=1, clip=0.05)
+        print('Loss: AsymmetricLossMultiLabel (gamma_neg=4, gamma_pos=1)')
+    else:
+        # Per-class pos_weight: Arc gets extra weight to address its difficulty
+        base_pos_weight = np.array([6660/5940] * 5)  # neg/pos ratio for balanced classes
+        base_pos_weight[0] *= args.arc_weight  # Arc (index 0) gets multiplier
+        pos_weight = torch.tensor(base_pos_weight, dtype=torch.float32).to(device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        if args.arc_weight != 1.0:
+            print(f'Loss: BCEWithLogitsLoss with Arc weight x{args.arc_weight}')
+        else:
+            print('Loss: BCEWithLogitsLoss (balanced)')
 
     # Optimizer & scheduler
     optimizer = build_optimizer(model, args)
