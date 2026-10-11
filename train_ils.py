@@ -1,7 +1,7 @@
 """Multi-label ILS interference classification training script.
 
 Uses timm ResNet backbone with BCEWithLogitsLoss for 5-class multi-label
-classification of spectrogram images (Arc, HV, IR, Jam, Lamp).
+classification of spectrogram images (Arc, HV, IB, Jam, AL).
 
 Example usage:
     python train_ils.py --model resnet18 --epochs 50 --batch-size 32

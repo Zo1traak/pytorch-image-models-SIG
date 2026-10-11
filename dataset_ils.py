@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-LABEL_NAMES = ['Arc', 'HV', 'IR', 'Jam', 'Lamp']
+LABEL_NAMES = ['Arc', 'HV', 'IB', 'Jam', 'AL']
 
 
 class ArcAwareSpecAugment:
@@ -96,7 +96,7 @@ class ILSInterferenceDataset(Dataset):
     Expected directory structure:
         split_name/
             images/       # spectrogram PNG files
-            labels.csv    # columns: filename, ..., Arc, HV, IR, Jam, Lamp, ...
+            labels.csv    # columns: filename, ..., Arc, HV, IB, Jam, AL, ...
     """
 
     def __init__(self, root: str, split: str = 'train', transform=None,
